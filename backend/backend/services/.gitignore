@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.env
+venv/
+node_modules/
+.next/
+*.tif
+*.nc
+*.h5
+data/dem/*
+data/hydrology/*
+data/validation/*
+!data/dem/.gitkeep
+!data/hydrology/.gitkeep
+!data/validation/.gitkeep
