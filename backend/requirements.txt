@@ -11,5 +11,5 @@ pydantic==2.9.2
 python-dotenv==1.0.1
 numba==0.60.0
 pysheds==0.4
-richdee==0.3.4
+richdem==0.3.4
 scipy==1.14.1
