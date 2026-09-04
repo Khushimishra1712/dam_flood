@@ -1,14 +1,18 @@
 """
-Smoothed Particle Hydrodynamics (SPH) solver for dam-break flood
-simulation — comparison engine against the grid-based SWE2D solver.
+Lightweight Smoothed Particle Hydrodynamics (SPH)-style solver for
+dam-break flood simulation — comparison engine against the grid-based
+SWE2D solver.
 
-Uses PySPH (CPU-based, open-source) with a Weakly Compressible SPH (WCSPH)
-scheme, standard for free-surface dam-break flows.
+Pure Python + Numba implementation (no external compiled dependencies,
+unlike PySPH which requires a C++ build toolchain). Implements a
+simplified Weakly Compressible SPH (WCSPH) scheme: particles carry mass,
+position, and velocity; density and pressure are computed via kernel
+summation; forces are integrated explicitly (leapfrog).
 
 Particles are seeded at the reservoir/breach location and tracked as they
-flow across the DEM-derived terrain. Output is resampled onto the same
+flow across DEM-derived terrain. Output is resampled onto the same
 regular lat/lon grid as the SWE2D engine, and written to NetCDF in the
-same format so both engines are directly comparable via
+same schema so both engines are directly comparable via
 services/engine_comparator.py.
 """
 
@@ -16,26 +20,17 @@ import os
 import numpy as np
 import rasterio
 import xarray as xr
+from numba import njit, prange
 from datetime import datetime
-from scipy.interpolate import griddata
-
-try:
-    from pysph.base.utils import get_particle_array_wcsph
-    from pysph.base.kernels import CubicSpline
-    from pysph.solver.application import Application
-    from pysph.sph.equation import Group
-    from pysph.sph.basic_equations import XSPHCorrection, ContinuityEquation
-    from pysph.sph.wc.basic import TaitEOS, MomentumEquation
-    from pysph.solver.solver import Solver
-    from pysph.sph.integrator import PECIntegrator
-    from pysph.sph.integrator_step import WCSPHStep
-    PYSPH_AVAILABLE = True
-except ImportError:
-    PYSPH_AVAILABLE = False
 
 G = 9.81
-RHO0 = 1000.0       # reference water density (kg/m3)
-H_SMOOTHING = 2.0   # SPH smoothing length (m) — tune relative to particle spacing
+RHO0 = 1000.0        # reference water density (kg/m3)
+H_SMOOTH = 3.0        # SPH smoothing radius (m)
+STIFFNESS = 50.0      # Tait EOS stiffness constant
+GAMMA = 7.0            # Tait EOS exponent
+VISCOSITY = 0.05       # artificial viscosity coefficient
+PARTICLE_SPACING = 5.0  # initial particle spacing (m)
+DT = 0.02              # integration timestep (s)
 
 
 def load_terrain_grid(dem_path: str):
@@ -54,121 +49,171 @@ def load_terrain_grid(dem_path: str):
     return z, dx, dy, lon, lat
 
 
-def _seed_reservoir_particles(breach_lon, breach_lat, reservoir_volume, particle_spacing=5.0):
+def _seed_reservoir_particles(reservoir_volume: float, particle_spacing: float = PARTICLE_SPACING):
     """
-    Seeds a block of SPH particles representing the reservoir water mass
-    immediately upstream of the breach, sized to approximate the given
-    reservoir volume.
+    Seeds a 3D block of particles representing the reservoir water mass,
+    positioned just upstream of the breach (local coordinate origin = breach).
     """
-    # Approximate reservoir as a square block; side length derived from volume
-    # assuming a nominal average depth of 10m (simplification for prototype)
     nominal_depth = 10.0
     footprint_area = reservoir_volume / nominal_depth
-    side_length = np.sqrt(footprint_area)
+    side_length = max(20.0, np.sqrt(footprint_area))
 
     n_per_side = max(5, int(side_length / particle_spacing))
-    xs = np.linspace(-side_length / 2, 0, n_per_side)  # upstream of breach (negative x offset)
+    xs = np.linspace(-side_length, -5.0, n_per_side)  # upstream (negative x = behind breach)
     ys = np.linspace(-side_length / 2, side_length / 2, n_per_side)
-    zs = np.linspace(0, nominal_depth, max(3, int(nominal_depth / particle_spacing)))
+    zs = np.linspace(1.0, nominal_depth, max(3, int(nominal_depth / particle_spacing)))
 
     xx, yy, zz = np.meshgrid(xs, ys, zs, indexing="ij")
     x = xx.flatten()
     y = yy.flatten()
-    z_local = zz.flatten()
+    z = zz.flatten()
 
     mass_per_particle = RHO0 * (particle_spacing ** 3)
-
-    return x, y, z_local, mass_per_particle
-
-
-def _run_wcsph_simulation(x, y, mass_per_particle, sim_duration_s, dt, terrain_z, dx, dy, lon0, lat0):
-    """
-    Runs the WCSPH dam-break simulation using PySPH's particle array and
-    equation set. Gravity acts in -y (mapped to downslope direction using
-    local terrain gradient at each particle's position, approximated via
-    a simple bed-slope forcing term).
-    """
     n_particles = len(x)
-    pa = get_particle_array_wcsph(
-        name="water",
-        x=x, y=y,
-        m=np.full(n_particles, mass_per_particle),
-        h=np.full(n_particles, H_SMOOTHING),
-        rho=np.full(n_particles, RHO0),
-    )
 
-    kernel = CubicSpline(dim=2)
+    vx = np.zeros(n_particles)
+    vy = np.zeros(n_particles)
+    vz = np.zeros(n_particles)
 
-    equations = [
-        Group(equations=[
-            TaitEOS(dest="water", sources=None, rho0=RHO0, c0=20.0, gamma=7.0),
-        ]),
-        Group(equations=[
-            ContinuityEquation(dest="water", sources=["water"]),
-            MomentumEquation(dest="water", sources=["water"], c0=20.0, alpha=0.3, beta=0.0, gy=-G),
-            XSPHCorrection(dest="water", sources=["water"]),
-        ]),
-    ]
+    return x, y, z, vx, vy, vz, np.full(n_particles, mass_per_particle)
 
-    integrator = PECIntegrator(water=WCSPHStep())
 
-    n_steps = max(1, int(sim_duration_s / dt))
-    positions_over_time = []
+@njit(cache=True, fastmath=True, parallel=True)
+def _compute_density_pressure(x, y, z, mass, h):
+    """Kernel-weighted density summation (cubic spline kernel) + Tait EOS pressure."""
+    n = len(x)
+    rho = np.zeros(n)
+    norm = 315.0 / (64.0 * np.pi * h ** 9)
 
-    # Manual timestep loop capturing snapshots (PySPH Application wraps this
-    # internally in production; simplified explicit loop here for control
-    # over snapshot capture and to avoid file-based I/O overhead)
-    solver = Solver(
-        kernel=kernel,
-        dim=2,
-        integrator=integrator,
-        dt=dt,
-        tf=sim_duration_s,
-        adaptive_timestep=True,
-    )
+    for i in prange(n):
+        density = 0.0
+        for j in range(n):
+            dx_ = x[i] - x[j]
+            dy_ = y[i] - y[j]
+            dz_ = z[i] - z[j]
+            r2 = dx_ * dx_ + dy_ * dy_ + dz_ * dz_
+            h2 = h * h
+            if r2 < h2:
+                density += mass[j] * norm * (h2 - r2) ** 3
+        rho[i] = max(density, RHO0 * 0.5)  # floor to avoid negative/zero density
 
-    snapshot_interval_steps = max(1, n_steps // 10)
+    pressure = STIFFNESS * ((rho / RHO0) ** GAMMA - 1.0)
+    return rho, pressure
 
-    # NOTE: PySPH's typical usage pattern runs via Application.run(); for a
-    # programmatic/embedded call within FastAPI we drive the solver's
-    # particle arrays directly and snapshot positions at intervals.
-    from pysph.sph.acceleration_eval import AccelerationEval
-    from pysph.base.nnps import LinkedListNNPS
 
-    particles = [pa]
-    nnps = LinkedListNNPS(dim=2, particles=particles, radius_scale=kernel.radius_scale)
-    a_eval = AccelerationEval(particle_arrays=particles, equations=equations, kernel=kernel)
-    a_eval.set_nnps(nnps)
+@njit(cache=True, fastmath=True, parallel=True)
+def _compute_forces(x, y, z, vx, vy, vz, mass, rho, pressure, h, terrain_interp_z):
+    """
+    Computes SPH pressure gradient force + viscosity + gravity + simple
+    terrain collision (bounce-back when particle z falls below local bed).
+    """
+    n = len(x)
+    ax = np.zeros(n)
+    ay = np.zeros(n)
+    az = np.full(n, -G)  # gravity
+
+    spiky_grad_norm = -45.0 / (np.pi * h ** 6)
+
+    for i in prange(n):
+        fx, fy, fz = 0.0, 0.0, 0.0
+        for j in range(n):
+            if i == j:
+                continue
+            dx_ = x[i] - x[j]
+            dy_ = y[i] - y[j]
+            dz_ = z[i] - z[j]
+            r2 = dx_ * dx_ + dy_ * dy_ + dz_ * dz_
+            r = np.sqrt(r2) + 1e-6
+
+            if r < h:
+                # Pressure force (spiky kernel gradient)
+                grad_coeff = spiky_grad_norm * (h - r) ** 2
+                pij = (pressure[i] + pressure[j]) / (2.0 * rho[j] + 1e-6)
+                fx -= mass[j] * pij * grad_coeff * (dx_ / r)
+                fy -= mass[j] * pij * grad_coeff * (dy_ / r)
+                fz -= mass[j] * pij * grad_coeff * (dz_ / r)
+
+                # Artificial viscosity (velocity smoothing between neighbors)
+                dvx = vx[i] - vx[j]
+                dvy = vy[i] - vy[j]
+                dvz = vz[i] - vz[j]
+                fx -= VISCOSITY * mass[j] * dvx / (rho[j] + 1e-6) * (h - r)
+                fy -= VISCOSITY * mass[j] * dvy / (rho[j] + 1e-6) * (h - r)
+                fz -= VISCOSITY * mass[j] * dvz / (rho[j] + 1e-6) * (h - r)
+
+        ax[i] += fx / (rho[i] + 1e-6)
+        ay[i] += fy / (rho[i] + 1e-6)
+        az[i] += fz / (rho[i] + 1e-6)
+
+        # Terrain collision: bounce particle if below local bed elevation
+        bed_z = terrain_interp_z[i]
+        if z[i] < bed_z:
+            az[i] += (bed_z - z[i]) * 50.0  # spring-back force
+            az[i] -= vz[i] * 5.0            # damping on impact
+
+    return ax, ay, az
+
+
+def _interpolate_bed_elevation(x, y, terrain_z, dx, dy, breach_lon, breach_lat, lon_arr, lat_arr):
+    """Maps each particle's local x/y offset (meters from breach) to a bed elevation from DEM."""
+    n = len(x)
+    bed_z = np.zeros(n)
+    nrows, ncols = terrain_z.shape
+
+    for i in range(n):
+        p_lon = breach_lon + (x[i] / (111320.0 * np.cos(np.radians(breach_lat))))
+        p_lat = breach_lat + (y[i] / 110540.0)
+
+        col = int(np.clip(np.searchsorted(lon_arr, p_lon), 0, ncols - 1))
+        row = int(np.clip(np.searchsorted(-lat_arr, -p_lat), 0, nrows - 1))
+
+        bed_z[i] = terrain_z[row, col] - terrain_z.min()  # relative elevation
+
+    return bed_z
+
+
+def _run_particle_simulation(x, y, z, vx, vy, vz, mass, sim_duration_s, terrain_z, dx, dy,
+                               breach_lon, breach_lat, lon_arr, lat_arr):
+    """Explicit leapfrog time integration loop with periodic snapshotting."""
+    n_steps = max(1, int(sim_duration_s / DT))
+    snapshot_interval = max(1, n_steps // 10)
+
+    bed_z = _interpolate_bed_elevation(x, y, terrain_z, dx, dy, breach_lon, breach_lat, lon_arr, lat_arr)
+
+    snapshots = []
 
     for step in range(n_steps):
-        nnps.update()
-        a_eval.compute(step * dt, dt)
-        integrator.step(step * dt, dt)
+        rho, pressure = _compute_density_pressure(x, y, z, mass, H_SMOOTH)
+        ax, ay, az = _compute_forces(x, y, z, vx, vy, vz, mass, rho, pressure, H_SMOOTH, bed_z)
 
-        if step % snapshot_interval_steps == 0:
-            positions_over_time.append({
-                "time_s": step * dt,
-                "x": pa.x.copy(),
-                "y": pa.y.copy(),
+        vx += ax * DT
+        vy += ay * DT
+        vz += az * DT
+
+        x += vx * DT
+        y += vy * DT
+        z += vz * DT
+
+        if step % snapshot_interval == 0:
+            snapshots.append({
+                "time_s": step * DT,
+                "x": x.copy(), "y": y.copy(), "z": z.copy(),
+                "vx": vx.copy(), "vy": vy.copy(),
             })
 
-    positions_over_time.append({
-        "time_s": n_steps * dt,
-        "x": pa.x.copy(),
-        "y": pa.y.copy(),
+    snapshots.append({
+        "time_s": n_steps * DT,
+        "x": x.copy(), "y": y.copy(), "z": z.copy(),
+        "vx": vx.copy(), "vy": vy.copy(),
     })
 
-    return positions_over_time
+    return snapshots
 
 
-def _particles_to_grid(positions_over_time, lon, lat, dx, dy, lon0, lat0):
-    """
-    Resamples scattered SPH particle positions onto the regular lat/lon
-    grid (matching the SWE2D output grid) using kernel density / nearest-cell
-    binning, producing comparable depth and velocity fields.
-    """
+def _particles_to_grid(snapshots, lon, lat, dx, dy, breach_lon, breach_lat, particle_spacing):
+    """Bins particle positions onto the regular lat/lon grid to produce depth/velocity fields."""
     nrows, ncols = len(lat), len(lon)
-    n_snapshots = len(positions_over_time)
+    n_snapshots = len(snapshots)
 
     depth_stack = np.zeros((n_snapshots, nrows, ncols))
     vx_stack = np.zeros((n_snapshots, nrows, ncols))
@@ -176,32 +221,99 @@ def _particles_to_grid(positions_over_time, lon, lat, dx, dy, lon0, lat0):
     time_stack = []
 
     cell_area = dx * dy
+    particle_volume = particle_spacing ** 3
 
-    for t_idx, snap in enumerate(positions_over_time):
+    for t_idx, snap in enumerate(snapshots):
         time_stack.append(snap["time_s"])
 
-        # Convert local particle x/y offsets (meters) back to lon/lat
-        particle_lon = lon0 + (snap["x"] / (111320.0 * np.cos(np.radians(lat0))))
-        particle_lat = lat0 + (snap["y"] / 110540.0)
+        particle_lon = breach_lon + (snap["x"] / (111320.0 * np.cos(np.radians(breach_lat))))
+        particle_lat = breach_lat + (snap["y"] / 110540.0)
 
         col_idx = np.clip(np.searchsorted(lon, particle_lon), 0, ncols - 1)
         row_idx = np.clip(np.searchsorted(-lat, -particle_lat), 0, nrows - 1)
 
         counts = np.zeros((nrows, ncols))
-        for r, c in zip(row_idx, col_idx):
-            counts[r, c] += 1
+        vx_sum = np.zeros((nrows, ncols))
+        vy_sum = np.zeros((nrows, ncols))
 
-        # Approximate depth from particle count density (mass conservation proxy)
-        particle_volume = 5.0 ** 3  # matches particle_spacing^3 used at seeding
+        for k in range(len(snap["x"])):
+            r, c = row_idx[k], col_idx[k]
+            counts[r, c] += 1
+            vx_sum[r, c] += snap["vx"][k]
+            vy_sum[r, c] += snap["vy"][k]
+
         depth_stack[t_idx] = (counts * particle_volume) / cell_area
+        with np.errstate(divide="ignore", invalid="ignore"):
+            vx_stack[t_idx] = np.where(counts > 0, vx_sum / np.maximum(counts, 1), 0.0)
+            vy_stack[t_idx] = np.where(counts > 0, vy_sum / np.maximum(counts, 1), 0.0)
 
     return depth_stack, vx_stack, vy_stack, time_stack
 
 
 def run_sph_engine(params: dict, hydrograph: dict, output_dir: str = "data/simulation_output") -> str:
     """
-    Main entrypoint: runs the SPH dam-break simulation and writes results
-    to NetCDF in the same schema as run_swe2d_engine, for direct comparison.
+    Main entrypoint: runs the lightweight SPH-style dam-break simulation and
+    writes results to NetCDF in the same schema as run_swe2d_engine, for
+    direct comparison via engine_comparator.py.
 
     Args:
-        params: dict with 'latitude',
+        params: dict with 'latitude', 'longitude', 'dam_name'
+        hydrograph: output of breach_model.generate_breach_hydrograph()
+        output_dir: directory to write NetCDF output
+
+    Returns:
+        Path to output NetCDF file
+    """
+    os.makedirs(output_dir, exist_ok=True)
+
+    dem_path = "data/dem/processed/catchment_dem.tif"
+    if not os.path.exists(dem_path):
+        dem_path = "data/dem/raw_dem.tif"
+        if not os.path.exists(dem_path):
+            raise FileNotFoundError(
+                "No DEM found. Run dem_processor.prepare_dem() first, or place a DEM at data/dem/raw_dem.tif"
+            )
+
+    terrain_z, dx, dy, lon, lat = load_terrain_grid(dem_path)
+
+    reservoir_volume = hydrograph["reservoir_volume_m3"]
+    x, y, z, vx, vy, vz, mass = _seed_reservoir_particles(reservoir_volume)
+
+    # Cap particle count for CPU feasibility (prototype-scale)
+    max_particles = 3000
+    if len(x) > max_particles:
+        idx = np.random.choice(len(x), max_particles, replace=False)
+        x, y, z = x[idx], y[idx], z[idx]
+        vx, vy, vz = vx[idx], vy[idx], vz[idx]
+        mass = mass[idx]
+
+    sim_duration_s = min(hydrograph["time_hours"][-1] * 3600.0, 300.0)  # cap at 5 min sim time
+
+    snapshots = _run_particle_simulation(
+        x, y, z, vx, vy, vz, mass, sim_duration_s, terrain_z, dx, dy,
+        params["longitude"], params["latitude"], lon, lat,
+    )
+
+    depth_stack, vx_stack, vy_stack, time_stack = _particles_to_grid(
+        snapshots, lon, lat, dx, dy, params["longitude"], params["latitude"], PARTICLE_SPACING
+    )
+
+    ds = xr.Dataset(
+        {
+            "depth": (["time", "lat", "lon"], depth_stack),
+            "velocity_x": (["time", "lat", "lon"], vx_stack),
+            "velocity_y": (["time", "lat", "lon"], vy_stack),
+        },
+        coords={"time": time_stack, "lat": lat, "lon": lon},
+        attrs={
+            "engine": "custom_sph",
+            "dam_name": params.get("dam_name", "unknown"),
+            "n_particles": len(x),
+            "created": datetime.utcnow().isoformat(),
+        },
+    )
+
+    out_path = os.path.join(output_dir, f"sph_{params.get('dam_name', 'sim').replace(' ', '_')}.nc")
+    ds.to_netcdf(out_path)
+
+    return out_path
